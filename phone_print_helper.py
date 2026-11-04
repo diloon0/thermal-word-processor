@@ -98,7 +98,7 @@ def build_phone_job(name, title, message, photo_bytes, photo_size, ink_limit):
 
 
 def setup_slip_job(url):
-    lines = [line("Phone printing", "size_2x2", "bold", "align_center"), line(""),
+    lines = [line("Print to " + PRINTER["name"], "size_2x2", "bold", "align_center"), line(""),
              line("Scan with your phone's camera, then add the page to your home screen.", "align_center"),
              line(""),
              {"items": [("object", {"type": "qr", "data": url, "size": "Medium"}, frozenset({"align_center"}))],
@@ -114,9 +114,9 @@ PAGE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="Receipt">
+<meta name="apple-mobile-web-app-title" content="Obelix">
 <meta name="theme-color" content="#1f2937">
-<title>Receipt printer</title>
+<title>Obelix</title>
 <style>
   :root { color-scheme: light dark; --accent: #2563eb; }
   * { box-sizing: border-box; }
@@ -140,7 +140,7 @@ PAGE = """<!DOCTYPE html>
   .ok { color: #16a34a; } .err { color: #dc2626; }
 </style></head>
 <body><main>
-  <h1>&#x1F9FE; Receipt printer</h1>
+  <h1>&#x1F9FE; Obelix</h1>
   <label for="name">Your name <span class="hint">(printed as "From ...")</span></label>
   <input id="name" type="text" maxlength="40" autocomplete="given-name" placeholder="Optional">
   <label for="title">Title</label>
@@ -304,7 +304,7 @@ class HelperApp(tk.Tk):
             return
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.headline.config(text="Phone printing is ON", foreground="green")
-        self.add_log(f"Ready. Printer at {self.printer_address}.")
+        self.add_log(f"Ready. {PRINTER['called']} is at {self.printer_address}.")
         self.protocol("WM_DELETE_WINDOW", self.stop)
 
     def stop(self):
@@ -340,8 +340,8 @@ class HelperApp(tk.Tk):
             self.add_log(f"Couldn't print for {name or who}: {err}")
             return False, str(err)
         except OSError:
-            self.add_log(f"Couldn't reach the printer for {name or who}.")
-            return False, "The laptop couldn't reach the printer. Is it on and plugged into the router?"
+            self.add_log(f"Couldn't reach {PRINTER['called']} for {name or who}.")
+            return False, f"The laptop couldn't reach {PRINTER['called']}. Is it on and plugged into the router?"
         what = " + photo" if photo else ""
         self.add_log(f"Printed for {name or who}{what}.")
         return True, "Printed! " + (warning or "")

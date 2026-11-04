@@ -37,7 +37,7 @@ from PIL import Image, ImageDraw, ImageOps, ImageTk
 import updater
 
 APP_NAME = "Thermal Word Processor"
-APP_VERSION = "1.0.0"                            # release.py bumps this
+APP_VERSION = "1.0.1"                            # release.py bumps this
 UPDATE_REPO = "diloon0/thermal-word-processor"   # where new versions are published (GitHub Releases)
 FROZEN = getattr(sys, "frozen", False)           # True when running as the packaged .exe
 
@@ -49,7 +49,9 @@ ALL_FEATURES = {"bold", "underline", "reverse", "small", "align", "upside", "sid
 
 PRINTERS = {
     "epson": {
-        "name": "Epson TM-m30",
+        "name": "Obelix",                  # a big black cube, so a nod to "obelisk"
+        "called": "Obelix",                # how sentences refer to it ("Couldn't reach Obelix...")
+        "model": "Epson TM-m30",
         "paper": "80mm",
         "width_dots": 576,                 # printable width of the paper, in printer dots
         "char_dots": {"A": 12, "B": 10},   # Font A fits 48 per line, Font B ("Small") fits 57
@@ -63,6 +65,8 @@ PRINTERS = {
     },
     "sunydog": {
         "name": "Sunydog MPT-II",
+        "called": "the Sunydog MPT-II",
+        "model": "",
         "paper": "58mm",
         "width_dots": 384,
         "char_dots": {"A": 12},            # 32 per line
@@ -761,7 +765,7 @@ class ThermalWordProcessor(tk.Tk):
 
         self.printer_menu = printer_menu = tk.Menu(menubar, tearoff=False)
         for key, printer in PRINTERS.items():
-            printer_menu.add_radiobutton(label=f"{printer['name']}  ({printer['paper']} paper)",
+            printer_menu.add_radiobutton(label=f"{printer['name']}  ({printer['model'] + ', ' if printer['model'] else ''}{printer['paper']} paper)",
                                          value=key, variable=self.printer_var, command=self.switch_printer)
         printer_menu.add_separator()
         darkness = tk.Menu(printer_menu, tearoff=False)
@@ -930,7 +934,7 @@ class ThermalWordProcessor(tk.Tk):
         if printer["connection"] == "bluetooth":
             ttk.Button(buttons, text="Find", width=5, command=self.find_port).pack(side="left", padx=(4, 0))
 
-        self.status = ttk.Label(outer, text=f"Ready to print on the {printer['name']}.", foreground="gray")
+        self.status = ttk.Label(outer, text=f"Ready to print on {printer['called']}.", foreground="gray")
         self.status.pack(anchor="w", pady=(8, 0))
 
         if doc:
@@ -1582,7 +1586,7 @@ class ThermalWordProcessor(tk.Tk):
 
         self.busy = True
         self.print_button.state(["disabled"])
-        self.set_status(f"Sending to the {self.printer['name']} at {address}...")
+        self.set_status(f"Sending to {self.printer['called']} at {address}...")
         # Connecting can take a few seconds, so do it off the UI thread
         threading.Thread(target=self._send_in_background, args=(self.printer_key, address, job, skipped),
                          daemon=True).start()
@@ -1606,7 +1610,7 @@ class ThermalWordProcessor(tk.Tk):
             ok, color = True, "green"
             text = "Printed!"
             if skipped:
-                text += f" (Skipped {' and '.join(sorted(s + 's' for s in skipped))}: the {printer['name']} can't print those.)"
+                text += f" (Skipped {' and '.join(sorted(s + 's' for s in skipped))}: {printer['called']} can't print those.)"
             if warning:
                 text += f" {warning}"
                 color = "darkorange"
@@ -1615,10 +1619,10 @@ class ThermalWordProcessor(tk.Tk):
         except OSError as err:
             reason = getattr(err, "strerror", None) or err
             if printer["connection"] == "network":
-                text = (f"Couldn't reach the {printer['name']} at {address}. Is it on and plugged into the router? "
+                text = (f"Couldn't reach {printer['called']} at {address}. Is it on and plugged into the router? "
                         f"If its address changed, it prints a slip with the new one. ({reason})")
             else:
-                text = (f"Couldn't reach the {printer['name']} on {address}. Is it switched on, and paired with "
+                text = (f"Couldn't reach {printer['called']} on {address}. Is it switched on, and paired with "
                         f"this computer in Settings > Bluetooth? ({reason})")
         self.call_soon(self._finish, key, address, ok, text, color)
 
@@ -1637,7 +1641,7 @@ class ThermalWordProcessor(tk.Tk):
         port = find_bluetooth_port(self.printer["bluetooth_name"])
         if port:
             self.address_var.set(port)
-            self.set_status(f"Found the {self.printer['name']} on {port}.", "green")
+            self.set_status(f"Found {self.printer['called']} on {port}.", "green")
         else:
             self.set_status(f"Couldn't find a paired \"{self.printer['bluetooth_name']}\". Turn the printer on and "
                             f"pair it in Settings > Bluetooth & devices > Add device, then click Find again.",
