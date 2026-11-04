@@ -97,7 +97,8 @@ def publish(version, notes, assume_yes):
         print(f"Not published. The version in {APP.name} is now {version}; the .exe is in {DIST}.")
         return
     run("git", "add", "-A")
-    run("git", "commit", "-m", f"Release v{version}\n\n{notes}")
+    # The notes are shown to people in the app's update pop-up, so the sign-off goes in the commit only
+    run("git", "commit", "-m", f"Release v{version}\n\n{notes}\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>")
     run("git", "tag", f"v{version}")
     # Borrow the GitHub CLI's sign-in for this push only (plain git on this computer isn't signed in)
     run("git", "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential",
