@@ -1,0 +1,18 @@
+# Personal settings: printer addresses, folders, and the phone page's secret link code
+thermal_printer_settings.json
+phone_print_settings.json
+
+# Build output (the .exe is published as a GitHub release, not committed)
+build/
+dist/
+*.spec
+__pycache__/
+
+# Your own receipts, photos and downloaded installers
+*.receipt
+*.jpg
+*.jpeg
+*.png
+*.heic
+*.gif
+*.exe
