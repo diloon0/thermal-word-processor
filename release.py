@@ -99,7 +99,9 @@ def publish(version, notes, assume_yes):
     run("git", "add", "-A")
     run("git", "commit", "-m", f"Release v{version}\n\n{notes}")
     run("git", "tag", f"v{version}")
-    run("git", "push", "origin", "HEAD", "--tags")
+    # Borrow the GitHub CLI's sign-in for this push only (plain git on this computer isn't signed in)
+    run("git", "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential",
+        "push", "origin", "HEAD", "--tags")
     run("gh", "release", "create", f"v{version}", EXE, SHA,
         "--title", f"Thermal Word Processor {version}", "--notes", notes)
     print(f"\nPublished version {version}.")
