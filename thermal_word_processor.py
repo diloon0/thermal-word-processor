@@ -8,7 +8,11 @@ The page is exactly as wide as the paper (one screen pixel per printer dot), so 
 screen where they will wrap on the receipt. Select text and use the toolbar (or Ctrl+B, Ctrl+U...)
 to style it. Insert pictures and QR codes from the Insert menu. Save receipts as .receipt files.
 
+Phone printing (Phone menu): phones on the same Wi-Fi can print a message or photo from a
+private web page while the app is open. "Print setup slip" prints a QR code that opens it.
+
 Double-click this file (or run `python thermal_word_processor.py`) to open it.
+Add --phone to switch phone printing on and show its window straight away.
 Needs Pillow (pip install pillow) for pictures.
 
 It's also packaged as a stand-alone ThermalWordProcessor.exe (see release.py) that needs nothing
@@ -17,18 +21,25 @@ installed and updates itself from GitHub Releases (see updater.py).
 
 import base64
 import ctypes
+import html
 import io
+import ipaddress
 import json
 import os
 import queue
 import random
+import secrets
 import socket
+import struct
 import sys
 import threading
+import time
 import winreg
 import tkinter as tk
 import tkinter.font as tkfont
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from ctypes import wintypes
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -84,7 +95,7 @@ DEFAULT_PRINTER = "sunydog" if FROZEN else "epson"   # the .exe is made for the 
 NETWORK_PORT = 9100   # the port network receipt printers listen on for print jobs
 if FROZEN:   # the .exe can live anywhere, so its settings live in the user's own app-data folder
     SETTINGS_FILE = Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME / "settings.json"
-else:        # running as a script: settings sit next to it (shared with phone_print_helper.py)
+else:        # running as a script: settings sit next to it
     SETTINGS_FILE = Path(__file__).with_name("thermal_printer_settings.json")
 
 SIZE_PRESETS = [("Normal", 1, 1), ("Tall", 1, 2), ("Wide", 2, 1), ("Large", 2, 2),
@@ -151,20 +162,29 @@ def char_width(tags, printer):
 # ---------------------------------------------------------------------------------------------
 
 def load_settings():
-    settings = {"printer": DEFAULT_PRINTER, "addresses": {}, "ink_limit": DEFAULT_INK_LIMIT, "folder": "",
-                "check_updates": True}
+    # "macs": each network printer's hardware address, learned on first contact, so it can be
+    # found again when it moves to another network (see locate_network_printer)
+    # "phone_on": phone printing was on when the app last closed, so it comes back on
+    settings = {"printer": DEFAULT_PRINTER, "addresses": {}, "macs": {}, "ink_limit": DEFAULT_INK_LIMIT,
+                "folder": "", "check_updates": True, "phone_on": False, "phone_token": ""}
     try:
         saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         if saved.get("printer") in PRINTERS:
             settings["printer"] = saved["printer"]
         if isinstance(saved.get("addresses"), dict):
             settings["addresses"].update(saved["addresses"])
+        if isinstance(saved.get("macs"), dict):
+            settings["macs"].update({k: v for k, v in saved["macs"].items() if isinstance(v, str)})
         if saved.get("ink_limit") in [limit for _, limit in DARKNESS]:
             settings["ink_limit"] = saved["ink_limit"]
         if isinstance(saved.get("folder"), str):
             settings["folder"] = saved["folder"]
         if isinstance(saved.get("check_updates"), bool):
             settings["check_updates"] = saved["check_updates"]
+        if isinstance(saved.get("phone_on"), bool):
+            settings["phone_on"] = saved["phone_on"]
+        if isinstance(saved.get("phone_token"), str) and len(saved["phone_token"]) >= 8:
+            settings["phone_token"] = saved["phone_token"]
     except (OSError, ValueError, AttributeError):
         pass   # no settings yet (or unreadable), so use the defaults
     return settings
@@ -557,6 +577,389 @@ def send_network(address, data, check=True):
     return warning
 
 
+# ---------- finding a network printer that moved ----------
+# A network printer gets a new address on each network it joins (and sometimes on the same one),
+# but its hardware (MAC) address never changes. Windows keeps two tables we can read: the
+# computer's own addresses (with their network masks), and the "ARP" table of which hardware
+# address answered at which network address.
+
+class PrinterNotFound(PrinterProblem):
+    """A network printer isn't at its saved address, and looking for it didn't turn it up."""
+
+
+iphlpapi = ctypes.WinDLL("iphlpapi")
+
+
+class IpAddrRow(ctypes.Structure):   # MIB_IPADDRROW
+    _fields_ = [("addr", wintypes.DWORD), ("index", wintypes.DWORD), ("mask", wintypes.DWORD),
+                ("bcast", wintypes.DWORD), ("reasm_size", wintypes.DWORD),
+                ("unused", wintypes.USHORT), ("type", wintypes.USHORT)]
+
+
+class IpNetRow(ctypes.Structure):    # MIB_IPNETROW
+    _fields_ = [("index", wintypes.DWORD), ("mac_len", wintypes.DWORD), ("mac", ctypes.c_ubyte * 8),
+                ("addr", wintypes.DWORD), ("type", wintypes.DWORD)]
+
+
+ARP_DYNAMIC, ARP_STATIC = 3, 4
+SCAN_LIMIT = 22   # networks bigger than this (fewer prefix bits) get only the 1,022 addresses around the computer
+
+
+def windows_table(func, row_type):
+    """Read one of Windows' network tables (a count followed by rows)."""
+    for _ in range(3):   # the table can grow between asking its size and reading it
+        size = wintypes.ULONG(0)
+        func(None, ctypes.byref(size), False)
+        if not size.value:
+            return []
+        buf = ctypes.create_string_buffer(size.value)
+        if func(buf, ctypes.byref(size), False) == 0:
+            count = wintypes.DWORD.from_buffer(buf).value
+            return list((row_type * count).from_buffer(buf, ctypes.sizeof(wintypes.DWORD)))
+    return []
+
+
+def ipv4(dword):
+    return socket.inet_ntoa(struct.pack("<I", dword))
+
+
+def local_networks():
+    """The networks this computer is on (Wi-Fi, Ethernet...), skipping ones with no real connection."""
+    networks = []
+    for row in windows_table(iphlpapi.GetIpAddrTable, IpAddrRow):
+        address = ipv4(row.addr)
+        if address.startswith(("127.", "169.254.", "0.")):
+            continue
+        network = ipaddress.IPv4Network(f"{address}/{ipv4(row.mask)}", strict=False)
+        if network.prefixlen < SCAN_LIMIT:
+            network = ipaddress.IPv4Network(f"{address}/{SCAN_LIMIT}", strict=False)
+        if network.prefixlen <= 30 and network not in networks:
+            networks.append(network)
+    return networks
+
+
+def arp_table():
+    """{network address: hardware address} for devices the computer has recently reached nearby."""
+    return {ipv4(row.addr): "-".join(f"{b:02x}" for b in row.mac[:6])
+            for row in windows_table(iphlpapi.GetIpNetTable, IpNetRow)
+            if row.mac_len == 6 and row.type in (ARP_DYNAMIC, ARP_STATIC)}
+
+
+def port_open(address, timeout=1.5):
+    """Does something at this address take print jobs? (Connects and hangs up; nothing prints.)"""
+    try:
+        with socket.create_connection((address, NETWORK_PORT), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def printer_at(address, mac):
+    return port_open(address) and arp_table().get(address) == mac
+
+
+def find_printer(mac):
+    """A network printer's current address, found by its hardware address, or None."""
+    for address, seen in arp_table().items():   # quick: the computer may have reached it recently
+        if seen == mac and printer_at(address, mac):
+            return address
+    # Otherwise knock on the print-job port of every address on this computer's networks. Each
+    # knock also teaches Windows the hardware address of whatever answers.
+    addresses = [str(host) for network in local_networks() for host in network.hosts()]
+    pool = ThreadPoolExecutor(max_workers=200)
+    try:
+        knocks = {pool.submit(port_open, address, 0.8): address for address in addresses}
+        for knock in as_completed(knocks):
+            if knock.result() and arp_table().get(knocks[knock]) == mac:
+                return knocks[knock]
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return None
+
+
+def locate_network_printer(printer, address, mac=None, searching=None):
+    """Where a network printer is now, as (address, mac). Call before sending it a job.
+
+    With its hardware address known: the saved address if the printer is still there, otherwise
+    wherever a search of this computer's networks finds it (raises PrinterNotFound if nowhere).
+    `searching()` is called just before a search starts, e.g. to say so on screen.
+    Without one: the address unchanged, plus the hardware address if the printer answers there,
+    so it can be remembered for next time.
+    """
+    if not mac:
+        return address, (arp_table().get(address) if port_open(address) else None)
+    if printer_at(address, mac):
+        return address, mac
+    if searching:
+        searching()
+    found = find_printer(mac)
+    if not found:
+        raise PrinterNotFound(f"Couldn't find {printer['called']} on this network. "
+                              "Is it switched on and plugged into the router?")
+    return found, mac
+
+
+# ---------------------------------------------------------------------------------------------
+# Phone printing: a private web page that phones on the same Wi-Fi can print from
+# ---------------------------------------------------------------------------------------------
+# While phone printing is on, the app runs a small web server. The page's address has a secret
+# code in it, so only people given the link (or the setup slip's QR code) can print. Jobs go to
+# the printer picked in the Printer menu. Closing the app switches phone printing off.
+
+PHONE_PORT = 8580
+PHONE_MAX_UPLOAD = 15 * 1024 * 1024   # bytes; photos are shrunk on the phone first, so this is generous
+PHONE_MAX_MESSAGE = 3000              # characters
+
+# Phones type "smart" punctuation the printers' character set doesn't have
+PHONE_PLAIN = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"', "–": "-",
+                             "—": "-", "…": "...", " ": " ", "•": "*"})
+
+
+def new_phone_token():
+    """The secret part of the page address. Made once, then kept so saved links keep working.
+
+    Reuses the code from the old stand-alone Phone Printing Helper if there is one, so phones that
+    saved its link keep working.
+    """
+    if not FROZEN:
+        try:
+            token = json.loads(Path(__file__).with_name("phone_print_settings.json").read_text(encoding="utf-8"))["token"]
+            if isinstance(token, str) and len(token) >= 8:
+                return token
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return secrets.token_urlsafe(9)
+
+
+def computer_address(printer, address):
+    """This computer's address on the network phones use to reach it."""
+    target = address if printer["connection"] == "network" else "8.8.8.8"   # Bluetooth: the main network
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((target, NETWORK_PORT))   # no data is sent; this just picks the right network
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+
+
+def phone_line(text, *tags):
+    tags = frozenset(tags)
+    return {"items": [("text", text, tags)] if text else [], "nl_tags": tags}
+
+
+def build_phone_job(printer, name, title, message, photo_bytes, photo_size, ink_limit):
+    """Phone submission -> (ESC/POS bytes, skipped). Raises ValueError with a friendly message."""
+    name, title = name.translate(PHONE_PLAIN).strip()[:40], title.translate(PHONE_PLAIN).strip()[:80]
+    message = message.translate(PHONE_PLAIN).replace("\r\n", "\n").rstrip()[:PHONE_MAX_MESSAGE]
+    if not title and not message.strip() and not photo_bytes:
+        raise ValueError("Type a message or choose a photo first.")   # a name alone isn't worth paper
+    lines = []
+    if title:
+        lines.append(phone_line(title, "size_2x2", "bold", "align_center"))
+    if name:
+        lines.append(phone_line(f"From {name}", "small", "align_center"))
+    if title or name:
+        lines.append(phone_line(""))
+    for paragraph in message.split("\n") if message else []:
+        lines.append(phone_line(paragraph))
+    if photo_bytes:
+        try:
+            source = prepare_picture(io.BytesIO(photo_bytes), printer["width_dots"])
+        except (OSError, ValueError, Image.DecompressionBombError):
+            raise ValueError("That photo couldn't be opened. Try a different one.")
+        size = photo_size if photo_size in PICTURE_SIZES else "Full width"
+        if message:
+            lines.append(phone_line(""))
+        lines.append({"items": [("object", {"type": "picture",
+                                            "gray": scale_picture(source, size, printer["width_dots"])},
+                                 frozenset({"align_center"}))], "nl_tags": frozenset()})
+    lines.append(phone_line(""))
+    lines.append(phone_line(time.strftime("%a %b %d, %Y  %I:%M %p").replace(" 0", " "), "small", "align_center"))
+    return build_job(printer, lines, printer["default_feed"], ink_limit)
+
+
+def setup_slip_job(printer, url):
+    lines = [phone_line("Print to " + printer["name"], "size_2x2", "bold", "align_center"), phone_line(""),
+             phone_line("Scan with your phone's camera, then add the page to your home screen.", "align_center"),
+             phone_line(""),
+             {"items": [("object", {"type": "qr", "data": url, "size": "Medium"}, frozenset({"align_center"}))],
+              "nl_tags": frozenset()},
+             phone_line(url, "small", "align_center"), phone_line(""),
+             phone_line(f"Works on the same Wi-Fi as this computer, while phone printing is on in the {APP_NAME}.",
+                        "small", "align_center")]
+    job, _ = build_job(printer, lines, printer["default_feed"], DEFAULT_INK_LIMIT)
+    return job
+
+
+def phone_page(printer):
+    """The page phones see, made to suit the printer."""
+    return (PHONE_PAGE.replace("{{NAME}}", html.escape(printer["name"]))
+            .replace("{{CHARS}}", str(printer["width_dots"] // printer["char_dots"]["A"]))
+            .replace("{{WIDTH}}", str(printer["width_dots"]))
+            .replace("{{PHOTO_HIDDEN}}", "" if "picture" in printer["features"] else " hidden"))
+
+
+PHONE_PAGE = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="{{NAME}}">
+<meta name="theme-color" content="#1f2937">
+<title>{{NAME}}</title>
+<style>
+  :root { color-scheme: light dark; --accent: #2563eb; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 17px/1.4 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+         background: Canvas; color: CanvasText; }
+  main { max-width: 520px; margin: 0 auto; padding: 18px 16px 40px; }
+  h1 { font-size: 1.35rem; margin: 4px 0 14px; }
+  label { display: block; font-weight: 600; margin: 14px 0 6px; font-size: .95rem; }
+  input[type=text], textarea, select { width: 100%; font: inherit; padding: 10px 12px; border-radius: 10px;
+         border: 1px solid #8884; background: Field; color: FieldText; }
+  textarea { min-height: 9.5em; resize: vertical; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 16px; }
+  .hint { font-size: .82rem; opacity: .7; margin-top: 4px; }
+  .photo { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .photo button, .photo label.pick { margin: 0; font-weight: 600; padding: 9px 14px; border-radius: 10px;
+         border: 1px solid #8886; background: transparent; color: inherit; font-size: .95rem; cursor: pointer; }
+  #preview { display: none; max-width: 100%; margin-top: 10px; border-radius: 6px; filter: grayscale(1); }
+  #send { width: 100%; margin-top: 20px; padding: 14px; font: inherit; font-weight: 700; color: white;
+          background: var(--accent); border: 0; border-radius: 12px; }
+  #send:disabled { opacity: .55; }
+  #status { margin-top: 14px; min-height: 1.4em; font-weight: 600; }
+  .ok { color: #16a34a; } .err { color: #dc2626; }
+</style></head>
+<body><main>
+  <h1>&#x1F9FE; {{NAME}}</h1>
+  <label for="name">Your name <span class="hint">(printed as "From ...")</span></label>
+  <input id="name" type="text" maxlength="40" autocomplete="given-name" placeholder="Optional">
+  <label for="title">Title</label>
+  <input id="title" type="text" maxlength="80" placeholder="Optional, printed big">
+  <label for="msg">Message</label>
+  <textarea id="msg" placeholder="Type your message..."></textarea>
+  <div class="hint" id="count">{{CHARS}} characters per printed line</div>
+  <div id="photobox"{{PHOTO_HIDDEN}}>
+  <label>Photo</label>
+  <div class="photo">
+    <label class="pick" for="file">Choose photo</label>
+    <input id="file" type="file" accept="image/*" hidden>
+    <select id="size" style="width:auto"><option>Full width</option><option>Half width</option><option>Third width</option></select>
+    <button id="clearphoto" type="button" hidden>Remove</button>
+  </div>
+  <img id="preview" alt="">
+  </div>
+  <button id="send">Print</button>
+  <div id="status"></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+$("name").value = localStorage.getItem("receipt-name") || "";
+let photo = null;   // base64 JPEG, already shrunk to the paper's width
+
+$("file").addEventListener("change", async () => {
+  const f = $("file").files[0];
+  if (!f) return;
+  try {
+    const img = await new Promise((ok, bad) => { const i = new Image(); i.onload = () => ok(i); i.onerror = bad;
+                                                 i.src = URL.createObjectURL(f); });
+    const w = Math.min({{WIDTH}}, img.naturalWidth), h = Math.round(img.naturalHeight * w / img.naturalWidth);
+    const c = document.createElement("canvas"); c.width = w; c.height = h;
+    const g = c.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, w, h); g.drawImage(img, 0, 0, w, h);
+    const url = c.toDataURL("image/jpeg", 0.92);
+    photo = url.split(",")[1];
+    $("preview").src = url; $("preview").style.display = "block"; $("clearphoto").hidden = false;
+  } catch (e) { show("That photo couldn't be opened.", "err"); }
+});
+$("clearphoto").onclick = () => { photo = null; $("file").value = ""; $("preview").style.display = "none";
+                                  $("clearphoto").hidden = true; };
+
+function show(text, cls) { $("status").textContent = text; $("status").className = cls || ""; }
+
+$("send").onclick = async () => {
+  const body = { name: $("name").value, title: $("title").value, message: $("msg").value,
+                 photo: photo, photo_size: $("size").value };
+  if (!body.title.trim() && !body.message.trim() && !photo) { show("Type a message or choose a photo first.", "err"); return; }
+  localStorage.setItem("receipt-name", body.name);
+  $("send").disabled = true; show("Sending...");
+  try {
+    const r = await fetch(location.pathname.replace(/\\/$/, "") + "/print",
+                          { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const j = await r.json();
+    show(j.message, j.ok ? "ok" : "err");
+    if (j.ok) { $("title").value = ""; $("msg").value = ""; $("clearphoto").onclick(); }
+  } catch (e) {
+    show("Couldn't reach the computer. Is phone printing on in the Thermal Word Processor, and is this phone on the same Wi-Fi?", "err");
+  }
+  $("send").disabled = false;
+};
+</script>
+</body></html>
+"""
+
+
+class PhoneHandler(BaseHTTPRequestHandler):
+    """Answers phones: the page itself, and the print requests it sends. self.server.app is the app."""
+
+    def page_path(self):
+        return f"/p/{self.server.app.phone_token}"
+
+    def reply(self, status, body, kind="text/html; charset=utf-8"):
+        data = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(status)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def reply_json(self, ok, message):
+        self.reply(200 if ok else 400, json.dumps({"ok": ok, "message": message}), "application/json")
+
+    def do_GET(self):
+        if self.path.rstrip("/") == self.page_path():
+            self.reply(200, phone_page(PRINTERS[self.server.app.printer_key]))
+        else:
+            self.reply(404, "Not found.", "text/plain; charset=utf-8")
+
+    def do_POST(self):
+        if self.path.rstrip("/") != self.page_path() + "/print":
+            self.reply(404, "Not found.", "text/plain; charset=utf-8")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if not 0 < length <= PHONE_MAX_UPLOAD:
+            self.reply_json(False, "That's too big to print. Try a smaller photo.")
+            return
+        try:
+            data = json.loads(self.rfile.read(length))
+            photo = base64.b64decode(data["photo"]) if data.get("photo") else None
+            fields = [str(data.get(k) or "") for k in ("name", "title", "message")]
+        except (ValueError, TypeError, KeyError):
+            self.reply_json(False, "Something went wrong sending that. Try again.")
+            return
+        ok, message = self.server.app.print_from_phone(*fields, photo, str(data.get("photo_size") or ""),
+                                                       self.client_address[0])
+        self.reply_json(ok, message)
+
+    def log_message(self, *args):
+        pass   # keep quiet; the Phone printing window shows what matters
+
+
+class PhoneServer(ThreadingHTTPServer):
+    allow_reuse_address = False   # on Windows that would let a second copy of the app share the port
+
+    def __init__(self, app):
+        self.app = app
+        super().__init__(("0.0.0.0", PHONE_PORT), PhoneHandler)
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):   # a second copy of the app gets "port busy" instead
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 # ---------------------------------------------------------------------------------------------
 # The editor widget
 # ---------------------------------------------------------------------------------------------
@@ -711,8 +1114,71 @@ class SizeDialog(Dialog):
 # The app
 # ---------------------------------------------------------------------------------------------
 
+class PhoneWindow(tk.Toplevel):
+    """Phone printing: on/off, the link phones open, the setup slip, and recent activity.
+
+    Closing this window leaves phone printing as it is; the app keeps the activity list.
+    """
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Phone printing")
+        self.resizable(False, False)
+        outer = ttk.Frame(self, padding=14)
+        outer.pack(fill="both", expand=True)
+        top = ttk.Frame(outer)
+        top.pack(fill="x")
+        self.headline = ttk.Label(top, font=("Segoe UI", 13, "bold"))
+        self.headline.pack(side="left")
+        self.toggle_button = ttk.Button(top, width=10, command=self.toggle)
+        self.toggle_button.pack(side="right")
+        self.where = ttk.Label(outer, wraplength=440)
+        self.where.pack(anchor="w", pady=(8, 2))
+        self.url_var = tk.StringVar()
+        ttk.Entry(outer, textvariable=self.url_var, width=46, state="readonly", font=("Consolas", 10)).pack(fill="x")
+        row = ttk.Frame(outer)
+        row.pack(fill="x", pady=(8, 0))
+        self.slip_button = ttk.Button(row, text="Print setup slip (QR code)", command=app.print_setup_slip)
+        self.slip_button.pack(side="left")
+        self.copy_button = ttk.Button(row, text="Copy link", command=app.copy_phone_link)
+        self.copy_button.pack(side="left", padx=(8, 0))
+        ttk.Label(outer, text="Recent activity:").pack(anchor="w", pady=(12, 2))
+        self.log = tk.Listbox(outer, height=7, width=60, activestyle="none")
+        self.log.pack(fill="both")
+        ttk.Label(outer, foreground="gray", wraplength=440,
+                  text="Phones print on the printer picked in the Printer menu. Keep the word processor open "
+                       "(minimizing is fine) and the computer awake; closing it switches phone printing off."
+                  ).pack(anchor="w", pady=(10, 0))
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: self.close())
+        self.refresh()
+
+    def toggle(self):
+        self.app.phone_var.set(not self.app.phone_var.get())
+        self.app.toggle_phone_printing()
+
+    def refresh(self):
+        on = self.app.phone_server is not None
+        printer = self.app.printer
+        self.headline.config(text=f"Phone printing is {'ON' if on else 'OFF'}", foreground="green" if on else "gray")
+        self.toggle_button.config(text="Turn off" if on else "Turn on")
+        self.where.config(text=f"Phones on the same Wi-Fi can print on {printer['called']} by opening this link:"
+                          if on else "Turn phone printing on to get the link phones open.")
+        self.url_var.set(self.app.phone_url if on else "")
+        for button in (self.slip_button, self.copy_button):
+            button.state(["!disabled"] if on else ["disabled"])
+        self.log.delete(0, "end")
+        for entry in self.app.phone_log:
+            self.log.insert("end", entry)
+
+    def close(self):
+        self.app.phone_window = None
+        self.destroy()
+
+
 class ThermalWordProcessor(tk.Tk):
-    def __init__(self):
+    def __init__(self, phone=False):
         super().__init__()
         self.settings = load_settings()
         self.busy = False
@@ -726,6 +1192,12 @@ class ThermalWordProcessor(tk.Tk):
         self.text = None
         self._refresh_queued = False
         self.ui_queue = queue.Queue()   # work handed from background threads to the window
+        self.print_lock = threading.Lock()   # one job at a time, whether from this window or a phone
+        self.phone_server = None        # the web server phones print through, while phone printing is on
+        self.phone_token = self.settings["phone_token"]
+        self.phone_url = ""             # plain string: safe to read from any thread
+        self.phone_log = []             # recent phone printing activity, newest first
+        self.phone_window = None
         if FROZEN:
             try:
                 self.iconbitmap(default=sys.executable)   # the receipt icon built into the .exe
@@ -735,10 +1207,15 @@ class ThermalWordProcessor(tk.Tk):
         self.printer_var = tk.StringVar(value=self.settings["printer"])
         self.ink_var = tk.DoubleVar(value=self.settings["ink_limit"])
         self.auto_update_var = tk.BooleanVar(value=self.settings["check_updates"])
+        self.phone_var = tk.BooleanVar(value=False)
         self.build_menus()
         self.protocol("WM_DELETE_WINDOW", self.quit_app)
         self.build_window()
         self.poll_ui_queue()
+        if phone or self.settings["phone_on"]:
+            self.start_phone_printing()
+        if phone:
+            self.show_phone_window()
         if FROZEN:
             self.after(5000, updater.remove_old_copy)   # left behind by the last update, if any
             if self.settings["check_updates"]:
@@ -774,6 +1251,12 @@ class ThermalWordProcessor(tk.Tk):
         printer_menu.add_cascade(label="Picture darkness", menu=darkness)
         self.darkness_index = printer_menu.index("end")
         menubar.add_cascade(label="Printer", menu=printer_menu)
+
+        phone_menu = tk.Menu(menubar, tearoff=False)
+        phone_menu.add_checkbutton(label="Phone printing on", variable=self.phone_var,
+                                   command=self.toggle_phone_printing)
+        phone_menu.add_command(label="Phone link and setup slip...", command=self.show_phone_window)
+        menubar.add_cascade(label="Phone", menu=phone_menu)
 
         help_menu = tk.Menu(menubar, tearoff=False)
         help_menu.add_command(label="Check for updates...", command=lambda: self.check_for_updates(manual=True))
@@ -1553,6 +2036,9 @@ class ThermalWordProcessor(tk.Tk):
         self.build_window(doc)
         self.text.edit_modified(modified)
         self.update_title()
+        if self.phone_server:
+            self.refresh_phone_link()
+            self.add_phone_log(f"Phones now print on {self.printer['called']}.")
 
     def change_darkness(self):
         self.settings["ink_limit"] = self.ink_var.get()
@@ -1565,6 +2051,55 @@ class ThermalWordProcessor(tk.Tk):
 
     def set_status(self, text, color="gray"):
         self.status.config(text=text, foreground=color)
+
+    def saved_address(self, key):
+        """Where a printer was last reached (safe to call from any thread)."""
+        printer = PRINTERS[key]
+        address = self.settings["addresses"].get(key)
+        if not address and printer["connection"] == "bluetooth":
+            address = find_bluetooth_port(printer["bluetooth_name"])
+        return address or printer["default_address"]
+
+    def send_job(self, key, address, job, notify=None):
+        """Send a finished job, finding the printer first if it has moved. Safe from any thread.
+
+        Returns (address, mac, warning): where it printed, the printer's hardware address (network
+        printers, when known), and a warning such as low paper. `notify(text)` hears about searches.
+        Raises PrinterProblem or OSError.
+        """
+        printer = PRINTERS[key]
+        mac = self.settings["macs"].get(key)
+        with self.print_lock:   # one job at a time
+            if printer["connection"] == "network":
+                old = address
+                address, mac = locate_network_printer(
+                    printer, address, mac,
+                    searching=notify and (lambda: notify(f"{printer['called']} isn't at {old}. "
+                                                         "Looking for it on this network...")))
+                if notify and address != old:
+                    notify(f"Found {printer['called']} at {address}. Sending...")
+                warning = send_network(address, job, check="status" in printer["features"])
+            else:
+                try:
+                    warning = send_bluetooth(address, job)
+                except OSError:
+                    # Maybe the saved port is wrong (new computer, re-paired printer): look it up and retry once
+                    found = find_bluetooth_port(printer["bluetooth_name"])
+                    if not found or found.upper() == address.upper():
+                        raise
+                    address = found
+                    warning = send_bluetooth(address, job)
+        return address, mac, warning
+
+    def remember_address(self, key, address, mac):
+        """Remember where a printer was reached (and its hardware address, to find it again)."""
+        self.settings["addresses"][key] = address
+        if mac:
+            self.settings["macs"][key] = mac
+        save_settings(self.settings)
+        if key == self.printer_key:
+            self.address_var.set(address)
+            self.refresh_phone_link()
 
     def print_receipt(self):
         if self.busy:
@@ -1593,20 +2128,10 @@ class ThermalWordProcessor(tk.Tk):
 
     def _send_in_background(self, key, address, job, skipped):
         printer = PRINTERS[key]
-        ok, color = False, "red"
+        ok, color, mac = False, "red", None
         try:
-            if printer["connection"] == "network":
-                warning = send_network(address, job, check="status" in printer["features"])
-            else:
-                try:
-                    warning = send_bluetooth(address, job)
-                except OSError:
-                    # Maybe the saved port is wrong (new computer, re-paired printer): look it up and retry once
-                    found = find_bluetooth_port(printer["bluetooth_name"])
-                    if not found or found.upper() == address.upper():
-                        raise
-                    address = found
-                    warning = send_bluetooth(address, job)
+            address, mac, warning = self.send_job(key, address, job,
+                                                  notify=lambda text: self.call_soon(self.set_status, text))
             ok, color = True, "green"
             text = "Printed!"
             if skipped:
@@ -1624,18 +2149,150 @@ class ThermalWordProcessor(tk.Tk):
             else:
                 text = (f"Couldn't reach {printer['called']} on {address}. Is it switched on, and paired with "
                         f"this computer in Settings > Bluetooth? ({reason})")
-        self.call_soon(self._finish, key, address, ok, text, color)
+        self.call_soon(self._finish, key, address, mac, ok, text, color)
 
-    def _finish(self, key, address, ok, text, color):
+    def _finish(self, key, address, mac, ok, text, color):
         self.busy = False
         if ok:   # remember the address that worked for next time
-            self.settings["addresses"][key] = address
-            save_settings(self.settings)
-            if key == self.printer_key:
-                self.address_var.set(address)
+            self.remember_address(key, address, mac)
         if self.print_button.winfo_exists():
             self.print_button.state(["!disabled"])
             self.set_status(text, color)
+
+    # ---------- phone printing ----------
+
+    def show_phone_window(self):
+        if self.phone_window:
+            self.phone_window.deiconify()
+            self.phone_window.lift()
+        else:
+            self.phone_window = PhoneWindow(self)
+        self.phone_window.focus_set()
+
+    def refresh_phone_window(self):
+        if self.phone_window:
+            self.phone_window.refresh()
+
+    def add_phone_log(self, text):
+        """Add a line to the phone printing activity list. Safe from any thread."""
+        self.call_soon(self._add_phone_log_now, f"{time.strftime('%I:%M %p').lstrip('0')}  {text}")
+
+    def _add_phone_log_now(self, entry):
+        self.phone_log = [entry] + self.phone_log[:49]
+        self.refresh_phone_window()
+
+    def toggle_phone_printing(self):
+        if self.phone_var.get():
+            self.start_phone_printing()
+        else:
+            self.stop_phone_printing()
+
+    def start_phone_printing(self):
+        if self.phone_server:
+            return
+        if not self.phone_token:
+            self.phone_token = self.settings["phone_token"] = new_phone_token()
+        try:
+            self.phone_server = PhoneServer(self)
+        except OSError as err:
+            self.phone_var.set(False)
+            self.add_phone_log(f"Couldn't switch phone printing on: port {PHONE_PORT} is busy. Is the "
+                               f"{APP_NAME} (or the old Phone Printing Helper) already open? ({err.strerror or err})")
+            self.show_phone_window()
+            return
+        threading.Thread(target=self.phone_server.serve_forever, daemon=True).start()
+        self.phone_var.set(True)
+        self.settings["phone_on"] = True
+        save_settings(self.settings)
+        self.refresh_phone_link()
+        threading.Thread(target=self.check_printer_for_phones, args=(self.printer_key,), daemon=True).start()
+
+    def stop_phone_printing(self):
+        server, self.phone_server = self.phone_server, None
+        if server:
+            def close():
+                server.shutdown()
+                server.server_close()
+            threading.Thread(target=close, daemon=True).start()
+            self.add_phone_log("Phone printing is off.")
+        self.phone_var.set(False)
+        self.settings["phone_on"] = False
+        save_settings(self.settings)
+        self.refresh_phone_window()
+
+    def refresh_phone_link(self):
+        if self.phone_server:
+            address = self.settings["addresses"].get(self.printer_key) or self.printer["default_address"]
+            self.phone_url = f"http://{computer_address(self.printer, address)}:{PHONE_PORT}/p/{self.phone_token}"
+        self.refresh_phone_window()
+
+    def check_printer_for_phones(self, key):
+        """When phone printing switches on, make sure the printer is where we think (finding it if not)."""
+        printer = PRINTERS[key]
+        if printer["connection"] != "network":
+            self.add_phone_log(f"Phone printing is on. Phones print on {printer['called']}.")
+            return
+        address = self.saved_address(key)
+        try:
+            with self.print_lock:
+                found, mac = locate_network_printer(
+                    printer, address, self.settings["macs"].get(key),
+                    searching=lambda: self.add_phone_log(f"{printer['called']} isn't at {address}. "
+                                                         "Looking for it on this network..."))
+        except PrinterNotFound as err:
+            self.add_phone_log(f"Phone printing is on, but: {err}")
+            return
+        if found != address:
+            self.add_phone_log(f"Found {printer['called']} at {found}.")
+        self.call_soon(self.remember_address, key, found, mac)
+        self.add_phone_log(f"Phone printing is on. Phones print on {printer['called']} at {found}.")
+
+    def phone_send(self, key, job, who):
+        """Send a phone's job (from a web server thread). Returns (ok, warning or error message)."""
+        printer = PRINTERS[key]
+        try:
+            address, mac, warning = self.send_job(key, self.saved_address(key), job, notify=self.add_phone_log)
+        except PrinterProblem as err:
+            self.add_phone_log(f"Couldn't print for {who}: {err}")
+            return False, str(err)
+        except OSError:
+            self.add_phone_log(f"Couldn't reach {printer['called']} for {who}.")
+            if printer["connection"] == "network":
+                return False, f"The computer couldn't reach {printer['called']}. Is it on and plugged into the router?"
+            return False, f"The computer couldn't reach {printer['called']}. Is it switched on and paired with the computer?"
+        self.call_soon(self.remember_address, key, address, mac)
+        return True, warning
+
+    def print_from_phone(self, name, title, message, photo, photo_size, who):
+        key = self.printer_key
+        printer = PRINTERS[key]
+        try:
+            job, skipped = build_phone_job(printer, name, title, message, photo, photo_size, self.settings["ink_limit"])
+        except ValueError as err:
+            return False, str(err)
+        ok, result = self.phone_send(key, job, name or who)
+        if not ok:
+            return False, result
+        what = " + photo" if photo and "picture" not in skipped else ""
+        self.add_phone_log(f"Printed for {name or who}{what}.")
+        text = "Printed!"
+        if "picture" in skipped:
+            text += f" (The photo was left off: {printer['called']} can't print pictures.)"
+        return True, text + (f" {result}" if result else "")
+
+    def print_setup_slip(self):
+        key, url = self.printer_key, self.phone_url
+
+        def go():
+            ok, result = self.phone_send(key, setup_slip_job(PRINTERS[key], url), "the setup slip")
+            if ok:
+                self.add_phone_log("Printed the setup slip." + (f" {result}" if result else ""))
+        threading.Thread(target=go, daemon=True).start()
+
+    def copy_phone_link(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.phone_url)
+        self.add_phone_log("Link copied.")
 
     def find_port(self):
         port = find_bluetooth_port(self.printer["bluetooth_name"])
@@ -1722,4 +2379,4 @@ class ThermalWordProcessor(tk.Tk):
 
 
 if __name__ == "__main__":
-    ThermalWordProcessor().mainloop()
+    ThermalWordProcessor(phone="--phone" in sys.argv[1:]).mainloop()
