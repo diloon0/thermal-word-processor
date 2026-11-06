@@ -2,7 +2,7 @@
 
 A small word processor for thermal receipt printers on Windows. The page is exactly as wide as the paper, so what you see is where lines will break on the receipt.
 
-- **Printers:** Epson TM-m30 (80mm, over the network, cuts the paper itself) and Sunydog / MPT-II (58mm, over Bluetooth). Pick one from the **Printer** menu.
+- **Printers:** Epson TM-m30 (80mm, over the network or a USB cable, cuts the paper itself) and Sunydog / MPT-II (58mm, over Bluetooth). Pick one from the **Printer** menu.
 - **Styles:** titles, bold, underline, reverse, small text, sizes up to 8x8, alignment, and upside-down and sideways lines.
 - **Extras:** pictures (double-click to resize), QR codes (double-click to edit), tick boxes and dividers.
 - **Files:** saves receipts as `.receipt` files.
@@ -16,6 +16,8 @@ Get **ThermalWordProcessor.exe** from the [latest release](../../releases/latest
 The first time, Windows may say *"Windows protected your PC"* because the app isn't signed. Click **More info → Run anyway**.
 
 For the Sunydog, pair the printer first: switch it on, then go to **Settings → Bluetooth & devices → Add device**. The app finds its port by itself (or click **Find**).
+
+For the TM-m30 on a USB cable (where it can't join the network), plug its square USB-B port into the computer and pick **Printer → Obelix by USB cable**. No driver is needed: the app finds the printer by itself, and **Check** shows whether it's plugged in.
 
 The app checks for new versions when it starts and asks before updating. You can turn this off under **Help**.
 

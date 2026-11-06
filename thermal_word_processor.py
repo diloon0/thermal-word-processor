@@ -34,6 +34,7 @@ import struct
 import sys
 import threading
 import time
+import uuid
 import winreg
 import tkinter as tk
 import tkinter.font as tkfont
@@ -67,6 +68,7 @@ PRINTERS = {
         "width_dots": 576,                 # printable width of the paper, in printer dots
         "char_dots": {"A": 12, "B": 10},   # Font A fits 48 per line, Font B ("Small") fits 57
         "connection": "network",
+        "via": "network",                  # shown in the Printer menu
         "address_label": "Printer address:",
         "default_address": "10.0.0.114",
         "default_feed": 2,                 # blank lines before the cut
@@ -82,6 +84,7 @@ PRINTERS = {
         "width_dots": 384,
         "char_dots": {"A": 12},            # 32 per line
         "connection": "bluetooth",
+        "via": "Bluetooth",
         "bluetooth_name": "MPT-II",        # what Windows calls it once paired; used to find its COM port
         "address_label": "Port:",
         "default_address": "COM7",
@@ -91,6 +94,12 @@ PRINTERS = {
         "sizes": ["Normal", "Large"],
     },
 }
+# The same TM-m30 on a USB cable (its square USB-B port to the computer), e.g. where it can't join
+# the network. Windows' own USB printer support is enough; no Epson driver is needed.
+PRINTERS["epson_usb"] = {**PRINTERS["epson"], "connection": "usb", "via": "USB cable",
+                         "usb_vendor": "04b8",   # Epson's USB vendor ID, used to find it
+                         "address_label": "", "default_address": "USB"}
+PRINTERS = {key: PRINTERS[key] for key in ("epson", "epson_usb", "sunydog")}   # menu order
 DEFAULT_PRINTER = "sunydog" if FROZEN else "epson"   # the .exe is made for the Sunydog's new home
 NETWORK_PORT = 9100   # the port network receipt printers listen on for print jobs
 if FROZEN:   # the .exe can live anywhere, so its settings live in the user's own app-data folder
@@ -574,6 +583,154 @@ def send_network(address, data, check=True):
         conn.settimeout(10)
         conn.sendall(data)
         conn.shutdown(socket.SHUT_WR)   # tell the printer the job is complete
+    return warning
+
+
+# ---------- USB printers ----------
+# A receipt printer plugged in by USB uses Windows' built-in USB printer support (usbprint),
+# which gives it a device path that bytes can be written to (and status read back from)
+# without any printer driver or print queue.
+
+USBPRINT_CLASS = "{28d78fad-5a12-11d1-ae5b-0000f803a8c2}"   # Windows' ID for "USB printer" devices
+GENERIC_READ = 0x80000000
+FILE_SHARE_READ, FILE_SHARE_WRITE = 1, 2
+FILE_FLAG_OVERLAPPED = 0x40000000   # lets a read or write give up after a while instead of hanging
+ERROR_IO_PENDING = 997
+WAIT_OBJECT_0 = 0
+
+
+class Overlapped(ctypes.Structure):   # OVERLAPPED
+    _fields_ = [("internal", ctypes.c_size_t), ("internal_high", ctypes.c_size_t),
+                ("offset", wintypes.DWORD), ("offset_high", wintypes.DWORD), ("event", wintypes.HANDLE)]
+
+
+kernel32.ReadFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                              ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+kernel32.CreateEventW.restype = wintypes.HANDLE
+kernel32.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel32.GetOverlappedResult.argtypes = [wintypes.HANDLE, wintypes.LPVOID, ctypes.POINTER(wintypes.DWORD),
+                                         wintypes.BOOL]
+kernel32.CancelIoEx.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+
+
+cfgmgr32 = ctypes.WinDLL("cfgmgr32")
+CM_GET_DEVICE_INTERFACE_LIST_PRESENT = 0   # only devices plugged in right now
+
+
+def usb_printer_paths():
+    """Device paths of every USB printer plugged in right now, e.g. "\\\\?\\USB#VID_04B8&PID_0E20#..."."""
+    guid = (ctypes.c_ubyte * 16).from_buffer_copy(uuid.UUID(USBPRINT_CLASS).bytes_le)
+    for _ in range(3):   # the list can change between asking its size and reading it
+        size = wintypes.ULONG(0)
+        if cfgmgr32.CM_Get_Device_Interface_List_SizeW(ctypes.byref(size), ctypes.byref(guid), None,
+                                                        CM_GET_DEVICE_INTERFACE_LIST_PRESENT) != 0:
+            return []
+        buffer = ctypes.create_unicode_buffer(size.value + 1)
+        if cfgmgr32.CM_Get_Device_Interface_ListW(ctypes.byref(guid), None, buffer, size.value,
+                                                  CM_GET_DEVICE_INTERFACE_LIST_PRESENT) == 0:
+            return [path for path in buffer[:size.value].split("\0") if path]   # one after another, \0 between
+    return []
+
+
+def find_usb_printer(vendor):
+    """The device path of a plugged-in USB printer from this vendor (e.g. "04b8", Epson), or None."""
+    return next((path for path in usb_printer_paths() if f"vid_{vendor}" in path.lower()), None)
+
+
+class UsbConnection:
+    """A USB printer opened for writing and reading, with timeouts. Used like a network socket."""
+
+    def __init__(self, path):
+        self.timeout = 10
+        self.handle = kernel32.CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                           None, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, None)
+        if self.handle == INVALID_HANDLE_VALUE:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        kernel32.CloseHandle(self.handle)
+
+    def settimeout(self, seconds):
+        self.timeout = seconds
+
+    def _transfer(self, func, buffer, size):
+        ov = Overlapped()
+        ov.event = kernel32.CreateEventW(None, True, False, None)
+        done = wintypes.DWORD()
+        try:
+            if not func(self.handle, buffer, size, ctypes.byref(done), ctypes.addressof(ov)):
+                error = ctypes.get_last_error()
+                if error != ERROR_IO_PENDING:
+                    raise ctypes.WinError(error)
+                if kernel32.WaitForSingleObject(ov.event, int(self.timeout * 1000)) != WAIT_OBJECT_0:
+                    kernel32.CancelIoEx(self.handle, ctypes.addressof(ov))
+                    kernel32.GetOverlappedResult(self.handle, ctypes.addressof(ov), ctypes.byref(done), True)
+                    raise socket.timeout("The printer stopped answering over USB.")
+            if not kernel32.GetOverlappedResult(self.handle, ctypes.addressof(ov), ctypes.byref(done), True):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return done.value
+        finally:
+            kernel32.CloseHandle(ov.event)
+
+    def sendall(self, data):
+        view = memoryview(data)
+        while view:
+            chunk = bytes(view[:65536])
+            sent = self._transfer(kernel32.WriteFile, chunk, len(chunk))
+            if not sent:
+                raise OSError("The printer stopped taking data over USB.")
+            view = view[sent:]
+
+    def _read_now(self, size):
+        """Whatever the printer has already sent (USB reads don't wait for an answer: b"" if none yet)."""
+        buffer = ctypes.create_string_buffer(size)
+        got = self._transfer(kernel32.ReadFile, buffer, size)   # fills buffer, so read it only afterwards
+        return buffer.raw[:got]
+
+    def recv(self, size):
+        """Wait (up to the timeout) for an answer, like a network socket does."""
+        deadline = time.monotonic() + self.timeout
+        while True:
+            data = self._read_now(size)
+            if data:
+                return data
+            if time.monotonic() >= deadline:
+                raise socket.timeout("The printer didn't answer over USB.")
+            time.sleep(0.02)   # answers take about 0.05 seconds
+
+    def drain(self):
+        """Throw away answers left over from earlier (they'd be mistaken for answers to new questions)."""
+        saved, self.timeout = self.timeout, 0.1   # in case a read does wait, don't wait long
+        try:
+            for _ in range(100):
+                if not self._read_now(64):
+                    return
+        except socket.timeout:
+            pass
+        finally:
+            self.timeout = saved
+
+
+def usb_missing_message(printer):
+    return (f"Couldn't find {printer['called']} on a USB cable. Is the cable plugged in at both ends, "
+            "and the printer switched on?")
+
+
+def send_usb(path, data, check=True):
+    with UsbConnection(path) as conn:
+        try:
+            if check:
+                conn.drain()
+            status = read_status(conn) if check else {}
+        except OSError:   # not every USB setup can read answers back; print anyway, just without the checks
+            status = {}
+        warning = check_status(status)
+        conn.settimeout(30)   # big pictures take a while to go through
+        conn.sendall(data)
     return warning
 
 
@@ -1242,7 +1399,7 @@ class ThermalWordProcessor(tk.Tk):
 
         self.printer_menu = printer_menu = tk.Menu(menubar, tearoff=False)
         for key, printer in PRINTERS.items():
-            printer_menu.add_radiobutton(label=f"{printer['name']}  ({printer['model'] + ', ' if printer['model'] else ''}{printer['paper']} paper)",
+            printer_menu.add_radiobutton(label=f"{printer['name']} by {printer['via']}  ({printer['model'] + ', ' if printer['model'] else ''}{printer['paper']} paper)",
                                          value=key, variable=self.printer_var, command=self.switch_printer)
         printer_menu.add_separator()
         darkness = tk.Menu(printer_menu, tearoff=False)
@@ -1411,9 +1568,13 @@ class ThermalWordProcessor(tk.Tk):
         if not address and printer["connection"] == "bluetooth":
             address = find_bluetooth_port(printer["bluetooth_name"])   # first run on a new computer
         self.address_var = tk.StringVar(value=address or printer["default_address"])
-        ttk.Label(buttons, text=printer["address_label"]).pack(side="left")
-        ttk.Entry(buttons, textvariable=self.address_var,
-                  width=14 if printer["connection"] == "network" else 7).pack(side="left", padx=(4, 0))
+        if printer["connection"] == "usb":   # nothing to type: the app finds it on the cable
+            ttk.Label(buttons, text="USB cable").pack(side="left")
+            ttk.Button(buttons, text="Check", width=6, command=self.check_usb).pack(side="left", padx=(4, 0))
+        else:
+            ttk.Label(buttons, text=printer["address_label"]).pack(side="left")
+            ttk.Entry(buttons, textvariable=self.address_var,
+                      width=14 if printer["connection"] == "network" else 7).pack(side="left", padx=(4, 0))
         if printer["connection"] == "bluetooth":
             ttk.Button(buttons, text="Find", width=5, command=self.find_port).pack(side="left", padx=(4, 0))
 
@@ -2079,6 +2240,12 @@ class ThermalWordProcessor(tk.Tk):
                 if notify and address != old:
                     notify(f"Found {printer['called']} at {address}. Sending...")
                 warning = send_network(address, job, check="status" in printer["features"])
+            elif printer["connection"] == "usb":
+                path = find_usb_printer(printer["usb_vendor"])   # looked up each time: it may be unplugged
+                if not path:
+                    raise PrinterNotFound(usb_missing_message(printer))
+                address = "USB"
+                warning = send_usb(path, job, check="status" in printer["features"])
             else:
                 try:
                     warning = send_bluetooth(address, job)
@@ -2146,6 +2313,9 @@ class ThermalWordProcessor(tk.Tk):
             if printer["connection"] == "network":
                 text = (f"Couldn't reach {printer['called']} at {address}. Is it on and plugged into the router? "
                         f"If its address changed, it prints a slip with the new one. ({reason})")
+            elif printer["connection"] == "usb":
+                text = (f"Couldn't send to {printer['called']} over USB. Is it switched on, with the cable "
+                        f"plugged in at both ends? ({reason})")
             else:
                 text = (f"Couldn't reach {printer['called']} on {address}. Is it switched on, and paired with "
                         f"this computer in Settings > Bluetooth? ({reason})")
@@ -2259,6 +2429,8 @@ class ThermalWordProcessor(tk.Tk):
             self.add_phone_log(f"Couldn't reach {printer['called']} for {who}.")
             if printer["connection"] == "network":
                 return False, f"The computer couldn't reach {printer['called']}. Is it on and plugged into the router?"
+            if printer["connection"] == "usb":
+                return False, f"The computer couldn't reach {printer['called']}. Is it on, with its USB cable plugged in?"
             return False, f"The computer couldn't reach {printer['called']}. Is it switched on and paired with the computer?"
         self.call_soon(self.remember_address, key, address, mac)
         return True, warning
@@ -2293,6 +2465,12 @@ class ThermalWordProcessor(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(self.phone_url)
         self.add_phone_log("Link copied.")
+
+    def check_usb(self):
+        if find_usb_printer(self.printer["usb_vendor"]):
+            self.set_status(f"{self.printer['called']} is plugged in by USB and ready.", "green")
+        else:
+            self.set_status(usb_missing_message(self.printer), "darkorange")
 
     def find_port(self):
         port = find_bluetooth_port(self.printer["bluetooth_name"])
