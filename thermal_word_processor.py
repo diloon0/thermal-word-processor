@@ -99,7 +99,13 @@ PRINTERS = {
 PRINTERS["epson_usb"] = {**PRINTERS["epson"], "connection": "usb", "via": "USB cable",
                          "usb_vendor": "04b8",   # Epson's USB vendor ID, used to find it
                          "address_label": "", "default_address": "USB"}
-PRINTERS = {key: PRINTERS[key] for key in ("epson", "epson_usb", "sunydog")}   # menu order
+# The same TM-m30 over Bluetooth, through a small "bridge" computer plugged into its USB port
+# (a Raspberry Pi running pi-bridge/obelix_bridge.py). For places where the printer and this
+# computer can't share a network or a cable. The bridge pairs with Windows under this name.
+PRINTERS["epson_bt"] = {**PRINTERS["epson"], "connection": "bridge", "via": "Bluetooth",
+                        "bluetooth_name": "Obelix", "address_label": "", "default_address": "Bluetooth"}
+PRINTERS = {key: PRINTERS[key] for key in ("epson", "epson_usb", "epson_bt", "sunydog")}   # menu order
+BRIDGE_CHANNEL = 1    # the Bluetooth serial channel the bridge listens on (its "channel" setting)
 DEFAULT_PRINTER = "sunydog" if FROZEN else "epson"   # the .exe is made for the Sunydog's new home
 NETWORK_PORT = 9100   # the port network receipt printers listen on for print jobs
 if FROZEN:   # the .exe can live anywhere, so its settings live in the user's own app-data folder
@@ -207,50 +213,68 @@ def save_settings(settings):
         pass   # not being able to remember settings shouldn't stop printing
 
 
+BTHENUM = r"SYSTEM\CurrentControlSet\Enum\BTHENUM"   # where Windows lists paired Bluetooth devices
+
+
+def registry_subkeys(path):
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
+            names, i = [], 0
+            while True:
+                try:
+                    names.append(winreg.EnumKey(key, i))
+                    i += 1
+                except OSError:
+                    return names
+    except OSError:
+        return []
+
+
+def registry_value(path, name):
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
+            return winreg.QueryValueEx(key, name)[0]
+    except OSError:
+        return None
+
+
+def paired_bluetooth_addresses(device_name):
+    """The Bluetooth addresses (12 hex digits each) of paired devices with this name. Sends nothing."""
+    addresses = set()
+    for dev in registry_subkeys(BTHENUM):
+        if dev.upper().startswith("DEV_"):
+            for inst in registry_subkeys(f"{BTHENUM}\\{dev}"):
+                name = registry_value(f"{BTHENUM}\\{dev}\\{inst}", "FriendlyName") or ""
+                if name.strip().lower() == device_name.lower():
+                    addresses.add(dev[4:].upper())
+    return addresses
+
+
 def find_bluetooth_port(device_name):
     """The COM port Windows gave a paired Bluetooth printer, found by its name (e.g. "MPT-II"), or None.
 
     Windows keeps paired devices (name and Bluetooth address) and their serial ports (address and
     COM port) in the registry, so this matches the two up. Nothing is sent to the printer.
     """
-    base = r"SYSTEM\CurrentControlSet\Enum\BTHENUM"
     serial_service = "{00001101-0000-1000-8000-00805F9B34FB}"   # Bluetooth "serial port" profile
-
-    def subkeys(path):
-        try:
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
-                names, i = [], 0
-                while True:
-                    try:
-                        names.append(winreg.EnumKey(key, i))
-                        i += 1
-                    except OSError:
-                        return names
-        except OSError:
-            return []
-
-    def value(path, name):
-        try:
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
-                return winreg.QueryValueEx(key, name)[0]
-        except OSError:
-            return None
-
-    addresses = set()   # Bluetooth addresses of paired devices with this name
-    for dev in subkeys(base):
-        if dev.upper().startswith("DEV_"):
-            for inst in subkeys(f"{base}\\{dev}"):
-                if (value(f"{base}\\{dev}\\{inst}", "FriendlyName") or "").strip().lower() == device_name.lower():
-                    addresses.add(dev[4:].upper())
-    for svc in subkeys(base):
+    addresses = paired_bluetooth_addresses(device_name)
+    for svc in registry_subkeys(BTHENUM):
         if svc.upper().startswith(serial_service):
-            for inst in subkeys(f"{base}\\{svc}"):
+            for inst in registry_subkeys(f"{BTHENUM}\\{svc}"):
                 address = inst.split("&")[-1].split("_")[0].upper()
                 if address in addresses:
-                    port = value(f"{base}\\{svc}\\{inst}\\Device Parameters", "PortName")
+                    port = registry_value(f"{BTHENUM}\\{svc}\\{inst}\\Device Parameters", "PortName")
                     if port:
                         return port
     return None
+
+
+def find_bluetooth_address(device_name):
+    """A paired Bluetooth device's address ("AA:BB:CC:DD:EE:FF"), found by its name, or None."""
+    addresses = sorted(paired_bluetooth_addresses(device_name))
+    if not addresses:
+        return None
+    return ":".join(addresses[0][i:i + 2] for i in range(0, 12, 2))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -731,6 +755,63 @@ def send_usb(path, data, check=True):
         warning = check_status(status)
         conn.settimeout(30)   # big pictures take a while to go through
         conn.sendall(data)
+    return warning
+
+
+# ---------- a printer behind a Bluetooth bridge ----------
+# The bridge (pi-bridge/obelix_bridge.py on a Raspberry Pi) is plugged into the printer's USB port
+# and passes bytes both ways over a Bluetooth serial connection. Python can open that connection
+# directly, like a network socket, so the printer can be asked about paper and its cover.
+
+def bridge_missing_message(printer):
+    return (f"Couldn't find a paired Bluetooth device called \"{printer['bluetooth_name']}\". Power the "
+            "bridge on, then pair it in Settings > Bluetooth & devices > Add device.")
+
+
+def bridge_silent_message(printer):
+    return (f"The Bluetooth bridge answered, but {printer['called']} didn't. Is the printer switched on, "
+            "with its USB cable plugged into the bridge?")
+
+
+def open_bridge(address):
+    """A Bluetooth serial connection to the bridge. Used like a network socket."""
+    conn = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+    try:
+        conn.settimeout(15)
+        conn.connect((address, BRIDGE_CHANNEL))
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def bridge_status(conn, printer):
+    """Ask the printer behind the bridge how it is. Raises PrinterProblem if it can't print."""
+    try:
+        status = read_status(conn)
+    except OSError:   # the bridge hangs up straight away when it has no printer
+        raise PrinterProblem(bridge_silent_message(printer)) from None
+    if all(value is None for value in status.values()):
+        raise PrinterProblem(bridge_silent_message(printer))
+    return check_status(status)
+
+
+def send_bridge(address, data, printer, check=True):
+    with open_bridge(address) as conn:
+        warning = bridge_status(conn, printer) if check else None
+        conn.settimeout(30)   # big pictures take a while to go through
+        conn.sendall(data)
+        if check:
+            # Answers come back in order, so an answer to one last question means the whole job
+            # reached the printer (not just the bridge)
+            conn.sendall(DLE + b"\x04\x04")
+            conn.settimeout(20)
+            try:
+                if not conn.recv(1):
+                    raise OSError("The bridge hung up before the job finished.")
+            except socket.timeout:
+                note = "Sent, but the printer didn't confirm it got everything."
+                warning = f"{warning} {note}" if warning else note
     return warning
 
 
@@ -1571,6 +1652,9 @@ class ThermalWordProcessor(tk.Tk):
         if printer["connection"] == "usb":   # nothing to type: the app finds it on the cable
             ttk.Label(buttons, text="USB cable").pack(side="left")
             ttk.Button(buttons, text="Check", width=6, command=self.check_usb).pack(side="left", padx=(4, 0))
+        elif printer["connection"] == "bridge":   # nothing to type either: found by its Bluetooth name
+            ttk.Label(buttons, text="Bluetooth").pack(side="left")
+            ttk.Button(buttons, text="Check", width=6, command=self.check_bridge).pack(side="left", padx=(4, 0))
         else:
             ttk.Label(buttons, text=printer["address_label"]).pack(side="left")
             ttk.Entry(buttons, textvariable=self.address_var,
@@ -2246,6 +2330,12 @@ class ThermalWordProcessor(tk.Tk):
                     raise PrinterNotFound(usb_missing_message(printer))
                 address = "USB"
                 warning = send_usb(path, job, check="status" in printer["features"])
+            elif printer["connection"] == "bridge":
+                found = find_bluetooth_address(printer["bluetooth_name"])   # looked up each time, like USB
+                if not found:
+                    raise PrinterNotFound(bridge_missing_message(printer))
+                address = "Bluetooth"
+                warning = send_bridge(found, job, printer, check="status" in printer["features"])
             else:
                 try:
                     warning = send_bluetooth(address, job)
@@ -2316,6 +2406,9 @@ class ThermalWordProcessor(tk.Tk):
             elif printer["connection"] == "usb":
                 text = (f"Couldn't send to {printer['called']} over USB. Is it switched on, with the cable "
                         f"plugged in at both ends? ({reason})")
+            elif printer["connection"] == "bridge":
+                text = (f"Couldn't reach {printer['called']}'s Bluetooth bridge. Is the bridge powered on "
+                        f"and within a few metres? ({reason})")
             else:
                 text = (f"Couldn't reach {printer['called']} on {address}. Is it switched on, and paired with "
                         f"this computer in Settings > Bluetooth? ({reason})")
@@ -2431,6 +2524,8 @@ class ThermalWordProcessor(tk.Tk):
                 return False, f"The computer couldn't reach {printer['called']}. Is it on and plugged into the router?"
             if printer["connection"] == "usb":
                 return False, f"The computer couldn't reach {printer['called']}. Is it on, with its USB cable plugged in?"
+            if printer["connection"] == "bridge":
+                return False, f"The computer couldn't reach {printer['called']}. Is its Bluetooth bridge powered on?"
             return False, f"The computer couldn't reach {printer['called']}. Is it switched on and paired with the computer?"
         self.call_soon(self.remember_address, key, address, mac)
         return True, warning
@@ -2471,6 +2566,33 @@ class ThermalWordProcessor(tk.Tk):
             self.set_status(f"{self.printer['called']} is plugged in by USB and ready.", "green")
         else:
             self.set_status(usb_missing_message(self.printer), "darkorange")
+
+    def check_bridge(self):
+        """Ask the printer behind the Bluetooth bridge how it is. Prints nothing."""
+        if self.busy:
+            return
+        printer = self.printer
+        self.set_status(f"Looking for {printer['called']} over Bluetooth...")
+
+        def work():
+            try:
+                address = find_bluetooth_address(printer["bluetooth_name"])
+                if not address:
+                    raise PrinterNotFound(bridge_missing_message(printer))
+                with self.print_lock, open_bridge(address) as conn:
+                    warning = bridge_status(conn, printer)
+                text, color = f"{printer['called']} is connected over Bluetooth and ready.", "green"
+                if warning:
+                    text, color = f"{text} {warning}", "darkorange"
+            except PrinterProblem as err:
+                text, color = str(err), "darkorange"
+            except OSError as err:
+                text = (f"Couldn't reach {printer['called']}'s Bluetooth bridge. Is the bridge powered on and "
+                        f"within a few metres? ({getattr(err, 'strerror', None) or err})")
+                color = "darkorange"
+            self.call_soon(lambda: self.status.winfo_exists() and self.set_status(text, color))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def find_port(self):
         port = find_bluetooth_port(self.printer["bluetooth_name"])

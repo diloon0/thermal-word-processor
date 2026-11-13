@@ -2,7 +2,7 @@
 
 A small word processor for thermal receipt printers on Windows. The page is exactly as wide as the paper, so what you see is where lines will break on the receipt.
 
-- **Printers:** Epson TM-m30 (80mm, over the network or a USB cable, cuts the paper itself) and Sunydog / MPT-II (58mm, over Bluetooth). Pick one from the **Printer** menu.
+- **Printers:** Epson TM-m30 (80mm, over the network, a USB cable or a Bluetooth bridge, cuts the paper itself) and Sunydog / MPT-II (58mm, over Bluetooth). Pick one from the **Printer** menu.
 - **Styles:** titles, bold, underline, reverse, small text, sizes up to 8x8, alignment, and upside-down and sideways lines.
 - **Extras:** pictures (double-click to resize), QR codes (double-click to edit), tick boxes and dividers.
 - **Files:** saves receipts as `.receipt` files.
@@ -18,6 +18,8 @@ The first time, Windows may say *"Windows protected your PC"* because the app is
 For the Sunydog, pair the printer first: switch it on, then go to **Settings → Bluetooth & devices → Add device**. The app finds its port by itself (or click **Find**).
 
 For the TM-m30 on a USB cable (where it can't join the network), plug its square USB-B port into the computer and pick **Printer → Obelix by USB cable**. No driver is needed: the app finds the printer by itself, and **Check** shows whether it's plugged in.
+
+For the TM-m30 over Bluetooth, a Raspberry Pi plugged into the printer's USB port acts as a bridge. [pi-bridge/](pi-bridge/) has the program and setup steps (drafted, not yet tried on a real Pi). Once the bridge is paired with Windows, pick **Printer → Obelix by Bluetooth**; **Check** shows whether the printer is reachable.
 
 The app checks for new versions when it starts and asks before updating. You can turn this off under **Help**.
 
@@ -35,4 +37,4 @@ Phones print on the printer picked in the **Printer** menu. The page's link has 
 - `python release.py build` builds `dist\ThermalWordProcessor.exe`.
 - `python release.py publish 1.0.1 "What changed"` bumps the version, builds, and (after confirming) pushes and creates the GitHub release that installed copies update from.
 
-Also here: `tm_m30_sampler.py` (a feature sampler receipt).
+Also here: `tm_m30_sampler.py` (a feature sampler receipt) and `pi-bridge/` (the Bluetooth bridge; `python pi-bridge/test_bridge.py` tests it without a Pi or printer).

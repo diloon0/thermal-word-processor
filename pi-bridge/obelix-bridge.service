@@ -1,0 +1,16 @@
+[Unit]
+Description=Obelix printer bridge (Bluetooth to USB)
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+ExecStart=/usr/bin/python3 -u /usr/local/bin/obelix-bridge
+Restart=always
+RestartSec=3
+# The bridge only needs Bluetooth, the USB printer and the Pi's light
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=no
+
+[Install]
+WantedBy=multi-user.target
