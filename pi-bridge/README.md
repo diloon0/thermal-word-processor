@@ -12,9 +12,17 @@ The bridge only passes bytes along, in both directions, for one computer at a ti
 processor still asks the printer about paper and its cover before each job, and waits for the
 printer to confirm that the whole job arrived.
 
-**Status: drafted and tested against a pretend printer only.** The byte-passing and the word
-processor's side are covered by `test_bridge.py`. The Bluetooth and USB parts have not run on a
-real Pi yet; the steps below are the plan for doing that.
+**Status: working.** Set up on a Pi Zero W (Raspberry Pi OS Lite 32-bit) and run through every
+stage below with a real TM-m30: status answers (including "cover open") come back through
+`/dev/usb/lp0` in a few hundredths of a second, so the `pyusb` fallback wasn't needed, and the
+word processor's **Obelix by Bluetooth** checks and prints. The laptop-side tests are in
+`test_bridge.py`.
+
+Notes from the first setup:
+- Allow a minute or so after powering the Pi before printing; connecting earlier times out.
+- The Imager's newer images use cloud-init and restart once by themselves during the first start.
+- If your Pi user needs a password for `sudo`, run the installer from an SSH session where you
+  can type it.
 
 ## Files
 
