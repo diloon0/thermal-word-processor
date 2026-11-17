@@ -49,7 +49,7 @@ from PIL import Image, ImageDraw, ImageOps, ImageTk
 import updater
 
 APP_NAME = "Thermal Word Processor"
-APP_VERSION = "1.1.0"                            # release.py bumps this
+APP_VERSION = "1.2.0"                            # release.py bumps this
 UPDATE_REPO = "diloon0/thermal-word-processor"   # where new versions are published (GitHub Releases)
 FROZEN = getattr(sys, "frozen", False)           # True when running as the packaged .exe
 
